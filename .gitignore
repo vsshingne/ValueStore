@@ -5,3 +5,5 @@ web/dist/
 *.test
 coverage.out
 .runtime/
+data/
+web/tsconfig.tsbuildinfo

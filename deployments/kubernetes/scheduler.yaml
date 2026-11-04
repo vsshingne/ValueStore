@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultstore-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: vaultstore-scheduler}
+  template:
+    metadata:
+      labels: {app: vaultstore-scheduler}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532}
+      containers:
+        - name: scheduler
+          image: vaultstore-scheduler:1.0.0
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - configMapRef: {name: vaultstore-config}
+            - secretRef: {name: vaultstore-secrets}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 512Mi}
+          readinessProbe:
+            httpGet: {path: /api/v1/ready, port: 8080}
+          livenessProbe:
+            httpGet: {path: /api/v1/health, port: 8080}
+            initialDelaySeconds: 30
+          volumeMounts:
+            - {name: sources, mountPath: /sources, readOnly: true}
+            - {name: restores, mountPath: /restores}
+      volumes:
+        - name: sources
+          persistentVolumeClaim: {claimName: vaultstore-sources}
+        - name: restores
+          persistentVolumeClaim: {claimName: vaultstore-restores}

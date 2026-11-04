@@ -1,0 +1,107 @@
+name: vaultstore
+x-app: &app
+  DATABASE_URL: postgres://vaultstore:${POSTGRES_PASSWORD:?Run scripts/setup.py}@postgres:5432/vaultstore?sslmode=disable
+  S3_ENDPOINT: minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:?Run scripts/setup.py}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run scripts/setup.py}
+  API_TOKEN: ${API_TOKEN:?Run scripts/setup.py}
+  KAFKA_BROKERS: kafka:9092
+  BACKUP_ROOT: /sources
+  RESTORE_ROOT: /restores
+  CHUNK_SIZE: ${CHUNK_SIZE:-4194304}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: vaultstore
+      POSTGRES_DB: vaultstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/setup.py}
+    ports: ['127.0.0.1:5432:5432']
+    volumes: ['postgres:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U vaultstore -d vaultstore']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ['127.0.0.1:19092:19092']
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 8
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes: ['kafka:/var/lib/kafka/data']
+    healthcheck:
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null']
+      interval: 10s
+      timeout: 10s
+      retries: 20
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Run scripts/setup.py}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Run scripts/setup.py}
+    ports: ['127.0.0.1:9000:9000','127.0.0.1:9001:9001']
+    volumes: ['minio:/data']
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build: {context: ., args: {SERVICE: api}}
+    environment: *app
+    ports: ['127.0.0.1:8080:8080']
+    volumes: ['./data/sources:/sources:ro','./data/restores:/restores']
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+    restart: unless-stopped
+    stop_grace_period: 30s
+  worker:
+    build: {context: ., args: {SERVICE: worker}}
+    environment: *app
+    volumes: ['./data/sources:/sources:ro','./data/restores:/restores']
+    depends_on: {api: {condition: service_started}}
+    restart: unless-stopped
+    stop_grace_period: 30s
+  scheduler:
+    build: {context: ., args: {SERVICE: scheduler}}
+    environment: *app
+    volumes: ['./data/sources:/sources:ro','./data/restores:/restores']
+    depends_on: {api: {condition: service_started}}
+    restart: unless-stopped
+    stop_grace_period: 30s
+  frontend:
+    build: ./web
+    ports: ['127.0.0.1:3000:8080']
+    depends_on: [api]
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes: ['./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro','prometheus:/prometheus']
+    ports: ['127.0.0.1:9090:9090']
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Run scripts/setup.py}
+    ports: ['127.0.0.1:3001:3000']
+    volumes: ['grafana:/var/lib/grafana','./deployments/grafana/provisioning:/etc/grafana/provisioning:ro','./deployments/grafana/dashboards:/var/lib/grafana/dashboards:ro']
+volumes:
+  postgres:
+  kafka:
+  minio:
+  prometheus:
+  grafana:

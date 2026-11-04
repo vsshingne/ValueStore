@@ -1,33 +1,286 @@
 package metadata
 
 import (
- "context"
- "encoding/json"
- "errors"
- "fmt"
- "time"
- "github.com/google/uuid"
- "github.com/jackc/pgx/v5"
- "github.com/jackc/pgx/v5/pgxpool"
- "vaultstore/internal/model"
- "vaultstore/migrations"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
+	"vaultstore/internal/model"
+	"vaultstore/migrations"
 )
+
 const GCLock int64 = 78234901
+
 var ErrLease = errors.New("job lease lost")
-type Repository struct {Pool *pgxpool.Pool; Topic string}
-func Open(ctx context.Context,url,topic string)(*Repository,error){cfg,e:=pgxpool.ParseConfig(url);if e!=nil{return nil,e};cfg.MaxConns=48;cfg.ConnConfig.ConnectTimeout=10*time.Second;p,e:=pgxpool.NewWithConfig(ctx,cfg);if e!=nil{return nil,e};r:=&Repository{p,topic};if e=p.Ping(ctx);e!=nil{p.Close();return nil,e};return r,nil}
-func (r *Repository) Migrate(ctx context.Context)error{tx,e:=r.Pool.Begin(ctx);if e!=nil{return e};defer tx.Rollback(ctx);if _,e=tx.Exec(ctx,"SELECT pg_advisory_xact_lock(78234900)");e!=nil{return e};if _,e=tx.Exec(ctx,"CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)");e!=nil{return e};var exists bool;if e=tx.QueryRow(ctx,"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=1)").Scan(&exists);e!=nil{return e};if !exists{sql,e:=migrations.Files.ReadFile("001_initial.sql");if e!=nil{return e};if _,e=tx.Exec(ctx,string(sql));e!=nil{return e};if _,e=tx.Exec(ctx,"INSERT INTO schema_migrations VALUES(1)");e!=nil{return e}};return tx.Commit(ctx)}
-func Enqueue(ctx context.Context,tx pgx.Tx,topic,id string,delay time.Duration)error{ev:=model.Event{Version:1,ID:uuid.NewString(),JobID:id,Requested:time.Now().UTC()};b,e:=json.Marshal(ev);if e!=nil{return e};_,e=tx.Exec(ctx,"INSERT INTO outbox(id,job_id,topic,payload,available_at) VALUES($1,$2,$3,$4,now()+$5*interval '1 second')",ev.ID,id,topic,b,delay.Seconds());return e}
-func (r *Repository) NewBackup(ctx context.Context,source,name,kind string)(string,string,error){tx,e:=r.Pool.Begin(ctx);if e!=nil{return "","",e};defer tx.Rollback(ctx);sid,jid,e:=r.BackupTx(ctx,tx,source,name,kind);if e!=nil{return "","",e};e=tx.Commit(ctx);return sid,jid,e}
-func (r *Repository) BackupTx(ctx context.Context,tx pgx.Tx,source,name,kind string)(string,string,error){sid,jid:=uuid.NewString(),uuid.NewString();var parent *string;if kind=="incremental" {e:=tx.QueryRow(ctx,"SELECT id::text FROM snapshots WHERE source_id=$1 AND status='completed' ORDER BY completed_at DESC LIMIT 1",source).Scan(&parent);if e!=nil && !errors.Is(e,pgx.ErrNoRows){return "","",e}};if _,e:=tx.Exec(ctx,"INSERT INTO snapshots(id,source_id,name,type,parent_id) VALUES($1,$2,$3,$4,$5)",sid,source,name,kind,parent);e!=nil{return "","",e};if _,e:=tx.Exec(ctx,"INSERT INTO jobs(id,kind,snapshot_id) VALUES($1,'backup',$2)",jid,sid);e!=nil{return "","",e};if e:=Enqueue(ctx,tx,r.Topic,jid,0);e!=nil{return "","",e};_,e:=tx.Exec(ctx,"INSERT INTO audit_logs(action,resource_id) VALUES('backup.create',$1)",sid);return sid,jid,e}
-func (r *Repository) NewJob(ctx context.Context,kind,sid string,payload any)(string,error){tx,e:=r.Pool.Begin(ctx);if e!=nil{return "",e};defer tx.Rollback(ctx);var status string;if e=tx.QueryRow(ctx,"SELECT status FROM snapshots WHERE id=$1 FOR SHARE",sid).Scan(&status);e!=nil{return "",e};if status!="completed"{return "",fmt.Errorf("recovery point is not complete")};b,e:=json.Marshal(payload);if e!=nil{return "",e};id:=uuid.NewString();if _,e=tx.Exec(ctx,"INSERT INTO jobs(id,kind,snapshot_id,payload) VALUES($1,$2,$3,$4)",id,kind,sid,b);e!=nil{return "",e};if e=Enqueue(ctx,tx,r.Topic,id,0);e!=nil{return "",e};if _,e=tx.Exec(ctx,"INSERT INTO audit_logs(action,resource_id) VALUES($1,$2)",kind+".create",id);e!=nil{return "",e};return id,tx.Commit(ctx)}
-func (r *Repository) Claim(ctx context.Context,id,worker string,lease time.Duration)(model.Job,error){var j model.Job;j.Token=uuid.NewString();e:=r.Pool.QueryRow(ctx,`UPDATE jobs SET status='running',token=$2,worker_id=$3,lease_until=now()+$4*interval '1 second',attempt=attempt+1,updated_at=now(),error=NULL WHERE id=$1 AND status IN ('queued','retrying') RETURNING id::text,kind,status,snapshot_id::text,payload,attempt`,id,j.Token,worker,lease.Seconds()).Scan(&j.ID,&j.Kind,&j.Status,&j.Snapshot,&j.Payload,&j.Attempt);return j,e}
-func (r *Repository) Heartbeat(ctx context.Context,j model.Job,lease time.Duration)error{tag,e:=r.Pool.Exec(ctx,"UPDATE jobs SET lease_until=now()+$3*interval '1 second',updated_at=now() WHERE id=$1 AND token=$2 AND status='running' AND lease_until>now()",j.ID,j.Token,lease.Seconds());if e==nil && tag.RowsAffected()!=1{return ErrLease};return e}
-func Fence(ctx context.Context,tx pgx.Tx,j model.Job)error{var id string;e:=tx.QueryRow(ctx,"SELECT id::text FROM jobs WHERE id=$1 AND token=$2 AND status='running' AND lease_until>now() FOR UPDATE",j.ID,j.Token).Scan(&id);if errors.Is(e,pgx.ErrNoRows){return ErrLease};return e}
-func (r *Repository) Complete(ctx context.Context,j model.Job,report any)error{tx,e:=r.Pool.Begin(ctx);if e!=nil{return e};defer tx.Rollback(ctx);if e=Fence(ctx,tx,j);e!=nil{return e};b,e:=json.Marshal(report);if e!=nil{return e};if _,e=tx.Exec(ctx,"UPDATE jobs SET status='completed',report=$2,lease_until=NULL,updated_at=now() WHERE id=$1",j.ID,b);e!=nil{return e};return tx.Commit(ctx)}
-func Backoff(attempt int) time.Duration{if attempt<1{attempt=1};if attempt>8{attempt=8};return time.Second*time.Duration(1<<attempt)}
-func (r *Repository) Fail(ctx context.Context,j model.Job,cause error,max int,permanent bool)error{tx,e:=r.Pool.Begin(ctx);if e!=nil{return e};defer tx.Rollback(ctx);if e=Fence(ctx,tx,j);e!=nil{return e};status,topic:="retrying",r.Topic;if permanent || j.Attempt>=max{status="failed";topic+=".dead"};if _,e=tx.Exec(ctx,"UPDATE jobs SET status=$2,error=$3,lease_until=NULL,updated_at=now() WHERE id=$1",j.ID,status,cause.Error());e!=nil{return e};if status=="failed" && j.Kind=="backup"{if _,e=tx.Exec(ctx,"UPDATE snapshots SET status='failed' WHERE id=$1 AND status='pending'",j.Snapshot);e!=nil{return e}};if e=Enqueue(ctx,tx,topic,j.ID,Backoff(j.Attempt));e!=nil{return e};return tx.Commit(ctx)}
-func (r *Repository) LoadManifest(ctx context.Context,id string)(model.Manifest,error){var b []byte;var h string;e:=r.Pool.QueryRow(ctx,"SELECT manifest,checksum FROM snapshots WHERE id=$1 AND status='completed'",id).Scan(&b,&h);if e!=nil{return model.Manifest{},e};return model.Decode(b,h)}
-func (r *Repository) SaveManifest(ctx context.Context,j model.Job,m model.Manifest)error{b,h,e:=m.Encode();if e!=nil{return e};tx,e:=r.Pool.Begin(ctx);if e!=nil{return e};defer tx.Rollback(ctx);if e=Fence(ctx,tx,j);e!=nil{return e};var total int64;for _,f:=range m.Files{fid:=uuid.NewString();if _,e=tx.Exec(ctx,"INSERT INTO files(id,snapshot_id,path,size,hash,directory) VALUES($1,$2,$3,$4,$5,$6)",fid,m.ID,f.Path,f.Size,f.Hash,f.Directory);e!=nil{return e};for i,c:=range f.Chunks{if _,e=tx.Exec(ctx,"INSERT INTO file_chunks(file_id,ordinal,chunk_hash) VALUES($1,$2,$3)",fid,i,c.Hash);e!=nil{return e}};total+=f.Size};if _,e=tx.Exec(ctx,"UPDATE snapshots SET status='completed',manifest=$2,checksum=$3,logical_bytes=$4,completed_at=now() WHERE id=$1 AND status='pending'",m.ID,b,h,total);e!=nil{return e};if _,e=tx.Exec(ctx,"UPDATE jobs SET status='completed',progress=$2,lease_until=NULL,updated_at=now() WHERE id=$1",j.ID,total);e!=nil{return e};return tx.Commit(ctx)}
+
+type Repository struct {
+	Pool  *pgxpool.Pool
+	Topic string
+}
+
+func Open(ctx context.Context, url, topic string) (*Repository, error) {
+	cfg, e := pgxpool.ParseConfig(url)
+	if e != nil {
+		return nil, e
+	}
+	cfg.MaxConns = 48
+	cfg.ConnConfig.ConnectTimeout = 10 * time.Second
+	p, e := pgxpool.NewWithConfig(ctx, cfg)
+	if e != nil {
+		return nil, e
+	}
+	r := &Repository{p, topic}
+	if e = p.Ping(ctx); e != nil {
+		p.Close()
+		return nil, e
+	}
+	return r, nil
+}
+func (r *Repository) Migrate(ctx context.Context) error {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if _, e = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(78234900)"); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)"); e != nil {
+		return e
+	}
+	var exists bool
+	if e = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=1)").Scan(&exists); e != nil {
+		return e
+	}
+	if !exists {
+		sql, e := migrations.Files.ReadFile("001_initial.sql")
+		if e != nil {
+			return e
+		}
+		if _, e = tx.Exec(ctx, string(sql)); e != nil {
+			return e
+		}
+		if _, e = tx.Exec(ctx, "INSERT INTO schema_migrations VALUES(1)"); e != nil {
+			return e
+		}
+	}
+	return tx.Commit(ctx)
+}
+func Enqueue(ctx context.Context, tx pgx.Tx, topic, id string, delay time.Duration) error {
+	ev := model.Event{Version: 1, ID: uuid.NewString(), JobID: id, Requested: time.Now().UTC()}
+	b, e := json.Marshal(ev)
+	if e != nil {
+		return e
+	}
+	_, e = tx.Exec(ctx, "INSERT INTO outbox(id,job_id,topic,payload,available_at) VALUES($1,$2,$3,$4,now()+$5*interval '1 second')", ev.ID, id, topic, b, delay.Seconds())
+	return e
+}
+func (r *Repository) NewBackup(ctx context.Context, source, name, kind string) (string, string, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return "", "", e
+	}
+	defer tx.Rollback(ctx)
+	sid, jid, e := r.BackupTx(ctx, tx, source, name, kind)
+	if e != nil {
+		return "", "", e
+	}
+	e = tx.Commit(ctx)
+	return sid, jid, e
+}
+func (r *Repository) BackupTx(ctx context.Context, tx pgx.Tx, source, name, kind string) (string, string, error) {
+	sid, jid := uuid.NewString(), uuid.NewString()
+	var parent *string
+	if kind == "incremental" {
+		e := tx.QueryRow(ctx, "SELECT id::text FROM snapshots WHERE source_id=$1 AND status='completed' ORDER BY completed_at DESC LIMIT 1", source).Scan(&parent)
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return "", "", e
+		}
+	}
+	if _, e := tx.Exec(ctx, "INSERT INTO snapshots(id,source_id,name,type,parent_id) VALUES($1,$2,$3,$4,$5)", sid, source, name, kind, parent); e != nil {
+		return "", "", e
+	}
+	if _, e := tx.Exec(ctx, "INSERT INTO jobs(id,kind,snapshot_id) VALUES($1,'backup',$2)", jid, sid); e != nil {
+		return "", "", e
+	}
+	if e := Enqueue(ctx, tx, r.Topic, jid, 0); e != nil {
+		return "", "", e
+	}
+	_, e := tx.Exec(ctx, "INSERT INTO audit_logs(action,resource_id) VALUES('backup.create',$1)", sid)
+	return sid, jid, e
+}
+func (r *Repository) NewJob(ctx context.Context, kind, sid string, payload any) (string, error) {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return "", e
+	}
+	defer tx.Rollback(ctx)
+	var status string
+	if e = tx.QueryRow(ctx, "SELECT status FROM snapshots WHERE id=$1 FOR SHARE", sid).Scan(&status); e != nil {
+		return "", e
+	}
+	if status != "completed" {
+		return "", fmt.Errorf("recovery point is not complete")
+	}
+	b, e := json.Marshal(payload)
+	if e != nil {
+		return "", e
+	}
+	id := uuid.NewString()
+	if _, e = tx.Exec(ctx, "INSERT INTO jobs(id,kind,snapshot_id,payload) VALUES($1,$2,$3,$4)", id, kind, sid, b); e != nil {
+		return "", e
+	}
+	if e = Enqueue(ctx, tx, r.Topic, id, 0); e != nil {
+		return "", e
+	}
+	if _, e = tx.Exec(ctx, "INSERT INTO audit_logs(action,resource_id) VALUES($1,$2)", kind+".create", id); e != nil {
+		return "", e
+	}
+	return id, tx.Commit(ctx)
+}
+func (r *Repository) Claim(ctx context.Context, id, worker string, lease time.Duration) (model.Job, error) {
+	var j model.Job
+	j.Token = uuid.NewString()
+	e := r.Pool.QueryRow(ctx, `UPDATE jobs SET status='running',token=$2,worker_id=$3,lease_until=now()+$4*interval '1 second',attempt=attempt+1,updated_at=now(),error=NULL WHERE id=$1 AND status IN ('queued','retrying') AND next_attempt_at<=now() RETURNING id::text,kind,status,snapshot_id::text,payload,attempt`, id, j.Token, worker, lease.Seconds()).Scan(&j.ID, &j.Kind, &j.Status, &j.Snapshot, &j.Payload, &j.Attempt)
+	return j, e
+}
+func (r *Repository) Heartbeat(ctx context.Context, j model.Job, lease time.Duration) error {
+	tag, e := r.Pool.Exec(ctx, "UPDATE jobs SET lease_until=now()+$3*interval '1 second',updated_at=now() WHERE id=$1 AND token=$2 AND status='running' AND lease_until>now()", j.ID, j.Token, lease.Seconds())
+	if e == nil && tag.RowsAffected() != 1 {
+		return ErrLease
+	}
+	return e
+}
+func Fence(ctx context.Context, tx pgx.Tx, j model.Job) error {
+	var id string
+	e := tx.QueryRow(ctx, "SELECT id::text FROM jobs WHERE id=$1 AND token=$2 AND status='running' AND lease_until>now() FOR UPDATE", j.ID, j.Token).Scan(&id)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return ErrLease
+	}
+	return e
+}
+func (r *Repository) Complete(ctx context.Context, j model.Job, report any) error {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if e = Fence(ctx, tx, j); e != nil {
+		return e
+	}
+	b, e := json.Marshal(report)
+	if e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, "UPDATE jobs SET status='completed',report=$2,lease_until=NULL,updated_at=now() WHERE id=$1", j.ID, b); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+func Backoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 8 {
+		attempt = 8
+	}
+	return time.Second * time.Duration(1<<attempt)
+}
+func (r *Repository) Fail(ctx context.Context, j model.Job, cause error, max int, permanent bool) error {
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if e = Fence(ctx, tx, j); e != nil {
+		return e
+	}
+	status, topic := "retrying", r.Topic
+	if permanent || j.Attempt >= max {
+		status = "failed"
+		topic += ".dead"
+	}
+	if _, e = tx.Exec(ctx, "UPDATE jobs SET status=$2,error=$3,lease_until=NULL,next_attempt_at=now()+$4*interval '1 second',updated_at=now() WHERE id=$1", j.ID, status, cause.Error(), Backoff(j.Attempt).Seconds()); e != nil {
+		return e
+	}
+	if status == "failed" && j.Kind == "backup" {
+		if _, e = tx.Exec(ctx, "UPDATE snapshots SET status='failed' WHERE id=$1 AND status='pending'", j.Snapshot); e != nil {
+			return e
+		}
+	}
+	if e = Enqueue(ctx, tx, topic, j.ID, Backoff(j.Attempt)); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+func (r *Repository) LoadManifest(ctx context.Context, id string) (model.Manifest, error) {
+	var b []byte
+	var h string
+	e := r.Pool.QueryRow(ctx, "SELECT manifest,checksum FROM snapshots WHERE id=$1 AND status='completed'", id).Scan(&b, &h)
+	if e != nil {
+		return model.Manifest{}, e
+	}
+	return model.Decode(b, h)
+}
+func (r *Repository) SaveManifest(ctx context.Context, j model.Job, m model.Manifest) error {
+	b, h, e := m.Encode()
+	if e != nil {
+		return e
+	}
+	tx, e := r.Pool.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if e = Fence(ctx, tx, j); e != nil {
+		return e
+	}
+	var total int64
+	for _, f := range m.Files {
+		fid := uuid.NewString()
+		if _, e = tx.Exec(ctx, "INSERT INTO files(id,snapshot_id,path,size,hash,directory) VALUES($1,$2,$3,$4,$5,$6)", fid, m.ID, f.Path, f.Size, f.Hash, f.Directory); e != nil {
+			return e
+		}
+		for i, c := range f.Chunks {
+			if _, e = tx.Exec(ctx, "INSERT INTO file_chunks(file_id,ordinal,chunk_hash) VALUES($1,$2,$3)", fid, i, c.Hash); e != nil {
+				return e
+			}
+		}
+		total += f.Size
+	}
+	if _, e = tx.Exec(ctx, "UPDATE snapshots SET status='completed',manifest=$2,checksum=$3,logical_bytes=$4,completed_at=now() WHERE id=$1 AND status='pending'", m.ID, b, h, total); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, "UPDATE jobs SET status='completed',progress=$2,lease_until=NULL,updated_at=now() WHERE id=$1", j.ID, total); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+
 // HoldGC excludes collection across object upload and snapshot publication.
-func (r *Repository) HoldGC(ctx context.Context,exclusive bool)(func(),error){conn,e:=r.Pool.Acquire(ctx);if e!=nil{return nil,e};lock,unlock:="pg_advisory_lock_shared","pg_advisory_unlock_shared";if exclusive{lock,unlock="pg_advisory_lock","pg_advisory_unlock"};if _,e=conn.Exec(ctx,"SELECT "+lock+"($1)",GCLock);e!=nil{conn.Release();return nil,e};return func(){c,cancel:=context.WithTimeout(context.Background(),5*time.Second);defer cancel();if _,e:=conn.Exec(c,"SELECT "+unlock+"($1)",GCLock);e!=nil{conn.Conn().Close(c)};conn.Release()},nil}
+func (r *Repository) HoldGC(ctx context.Context, exclusive bool) (func(), error) {
+	conn, e := r.Pool.Acquire(ctx)
+	if e != nil {
+		return nil, e
+	}
+	lock, unlock := "pg_advisory_lock_shared", "pg_advisory_unlock_shared"
+	if exclusive {
+		lock, unlock = "pg_advisory_lock", "pg_advisory_unlock"
+	}
+	if _, e = conn.Exec(ctx, "SELECT "+lock+"($1)", GCLock); e != nil {
+		conn.Release()
+		return nil, e
+	}
+	return func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, e := conn.Exec(c, "SELECT "+unlock+"($1)", GCLock); e != nil {
+			conn.Conn().Close(c)
+		}
+		conn.Release()
+	}, nil
+}

@@ -1,7 +1,112 @@
 package engine
-import("context";"fmt";"strings";"github.com/jackc/pgx/v5";"vaultstore/internal/storage")
-func (e *Engine)DeleteSnapshot(ctx context.Context,id string)error{release,err:=e.Repo.HoldGC(ctx,true);if err!=nil{return err};defer release();return e.deleteSnapshot(ctx,id)}
-func (e *Engine)deleteSnapshot(ctx context.Context,id string)error{tx,err:=e.Repo.Pool.Begin(ctx);if err!=nil{return err};defer tx.Rollback(ctx);var sid string;if err=tx.QueryRow(ctx,"SELECT id::text FROM snapshots WHERE id=$1 FOR UPDATE",id).Scan(&sid);err!=nil{return err};var busy bool;if err=tx.QueryRow(ctx,"SELECT EXISTS(SELECT 1 FROM jobs WHERE snapshot_id=$1 AND status IN ('queued','running','retrying'))",id).Scan(&busy);err!=nil{return err};if busy{return fmt.Errorf("snapshot has active jobs")};if _,err=tx.Exec(ctx,"DELETE FROM snapshots WHERE id=$1",id);err!=nil{return err};if _,err=tx.Exec(ctx,"INSERT INTO audit_logs(action,resource_id) VALUES('snapshot.delete',$1)",id);err!=nil{return err};return tx.Commit(ctx)}
-func (e *Engine)Retention(ctx context.Context)error{rows,err:=e.Repo.Pool.Query(ctx,`SELECT id::text FROM (SELECT b.id,row_number() OVER(PARTITION BY b.source_id ORDER BY b.completed_at DESC) n,s.retention FROM snapshots b JOIN sources s ON s.id=b.source_id WHERE b.status='completed') x WHERE n>retention`);if err!=nil{return err};var ids []string;for rows.Next(){var id string;if err=rows.Scan(&id);err!=nil{rows.Close();return err};ids=append(ids,id)};err=rows.Err();rows.Close();if err!=nil{return err};for _,id:=range ids{if err=e.DeleteSnapshot(ctx,id);err!=nil{return err}};return e.GC(ctx)}
-func (e *Engine)GC(ctx context.Context)error{release,err:=e.Repo.HoldGC(ctx,true);if err!=nil{return err};defer release();return e.Store.List(ctx,func(o storage.Object)error{hash:=o.Key[strings.LastIndex(o.Key,"/")+1:];tx,err:=e.Repo.Pool.Begin(ctx);if err!=nil{return err};defer tx.Rollback(ctx);var referenced bool;if err=tx.QueryRow(ctx,"SELECT EXISTS(SELECT 1 FROM file_chunks WHERE chunk_hash=$1)",hash).Scan(&referenced);err!=nil{return err};if referenced{return nil};if err=e.Store.Delete(ctx,o.Key);err!=nil{return err};if _,err=tx.Exec(ctx,"DELETE FROM chunks WHERE hash=$1",hash);err!=nil{return err};return tx.Commit(ctx)})}
-var _ pgx.Tx
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"vaultstore/internal/storage"
+)
+
+func (e *Engine) DeleteSnapshot(ctx context.Context, id string) error {
+	release, err := e.Repo.HoldGC(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return e.deleteSnapshot(ctx, id)
+}
+func (e *Engine) deleteSnapshot(ctx context.Context, id string) error {
+	tx, err := e.Repo.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var sid string
+	if err = tx.QueryRow(ctx, "SELECT id::text FROM snapshots WHERE id=$1 FOR UPDATE", id).Scan(&sid); err != nil {
+		return err
+	}
+	var busy bool
+	if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM jobs WHERE snapshot_id=$1 AND status IN ('queued','running','retrying'))", id).Scan(&busy); err != nil {
+		return err
+	}
+	if busy {
+		return fmt.Errorf("snapshot has active jobs")
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM snapshots WHERE id=$1", id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO audit_logs(action,resource_id) VALUES('snapshot.delete',$1)", id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+func (e *Engine) Retention(ctx context.Context) error {
+	rows, err := e.Repo.Pool.Query(ctx, `SELECT id::text FROM (SELECT b.id,row_number() OVER(PARTITION BY b.source_id ORDER BY b.completed_at DESC) n,s.retention FROM snapshots b JOIN sources s ON s.id=b.source_id WHERE b.status='completed') x WHERE n>retention`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err = e.DeleteSnapshot(ctx, id); err != nil {
+			return err
+		}
+	}
+	return e.GC(ctx)
+}
+func (e *Engine) GC(ctx context.Context) error {
+	release, err := e.Repo.HoldGC(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Also protect against a worker losing its advisory-lock connection while
+	// its lease remains live (for example, a PostgreSQL connection interruption).
+	var busy bool
+	if err = e.Repo.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM jobs WHERE status='running' AND lease_until>now())").Scan(&busy); err != nil {
+		return err
+	}
+	if busy {
+		return nil
+	}
+	err = e.Store.List(ctx, func(o storage.Object) error {
+		hash := o.Key[strings.LastIndex(o.Key, "/")+1:]
+		tx, err := e.Repo.Pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		var referenced bool
+		if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM file_chunks WHERE chunk_hash=$1)", hash).Scan(&referenced); err != nil {
+			return err
+		}
+		if referenced {
+			return nil
+		}
+		if err = e.Store.Delete(ctx, o.Key); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "DELETE FROM chunks WHERE hash=$1", hash); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	})
+	if err != nil {
+		return err
+	}
+	// Missing orphan objects can leave metadata behind after a delete/commit crash.
+	_, err = e.Repo.Pool.Exec(ctx, "DELETE FROM chunks c WHERE NOT EXISTS(SELECT 1 FROM file_chunks f WHERE f.chunk_hash=c.hash)")
+	return err
+}

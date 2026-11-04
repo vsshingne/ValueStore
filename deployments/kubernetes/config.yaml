@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vaultstore-config
+data:
+  S3_ENDPOINT: minio.storage.svc.cluster.local:9000
+  S3_BUCKET: vaultstore
+  S3_SECURE: "false"
+  KAFKA_BROKERS: kafka.messaging.svc.cluster.local:9092
+  BACKUP_ROOT: /sources
+  RESTORE_ROOT: /restores
+  CHUNK_SIZE: "4194304"
+  WORKER_CONCURRENCY: "2"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultstore-sources
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultstore-restores
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 10Gi

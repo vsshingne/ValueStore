@@ -17,7 +17,7 @@ CREATE TABLE jobs (
  snapshot_id uuid NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
  status text NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','retrying','completed','failed','cancelled')),
  payload jsonb NOT NULL DEFAULT '{}', attempt integer NOT NULL DEFAULT 0, token uuid,
- lease_until timestamptz, worker_id text, progress bigint NOT NULL DEFAULT 0, error text,
+ lease_until timestamptz, next_attempt_at timestamptz NOT NULL DEFAULT now(), worker_id text, progress bigint NOT NULL DEFAULT 0, error text,
  report jsonb, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX jobs_recovery ON jobs(status,lease_until);

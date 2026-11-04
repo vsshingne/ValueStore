@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultstore-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: vaultstore-worker}
+  template:
+    metadata:
+      labels: {app: vaultstore-worker}
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532}
+      containers:
+        - name: worker
+          image: vaultstore-worker:1.0.0
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - configMapRef: {name: vaultstore-config}
+            - secretRef: {name: vaultstore-secrets}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: '2', memory: 1Gi}
+          readinessProbe:
+            httpGet: {path: /api/v1/ready, port: 8080}
+          livenessProbe:
+            httpGet: {path: /api/v1/health, port: 8080}
+            initialDelaySeconds: 30
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: sources, mountPath: /sources, readOnly: true}
+            - {name: restores, mountPath: /restores}
+      volumes:
+        - name: sources
+          persistentVolumeClaim: {claimName: vaultstore-sources}
+        - name: restores
+          persistentVolumeClaim: {claimName: vaultstore-restores}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultstore-worker
+spec:
+  selector: {app: vaultstore-worker}
+  ports: [{port: 8080, targetPort: 8080}]

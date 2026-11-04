@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultstore-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: vaultstore-api}
+  template:
+    metadata:
+      labels: {app: vaultstore-api}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532}
+      containers:
+        - name: api
+          image: vaultstore-api:1.0.0
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - configMapRef: {name: vaultstore-config}
+            - secretRef: {name: vaultstore-secrets}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 512Mi}
+          readinessProbe:
+            httpGet: {path: /api/v1/ready, port: 8080}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /api/v1/health, port: 8080}
+            initialDelaySeconds: 30
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: sources, mountPath: /sources, readOnly: true}
+            - {name: restores, mountPath: /restores}
+      volumes:
+        - name: sources
+          persistentVolumeClaim: {claimName: vaultstore-sources}
+        - name: restores
+          persistentVolumeClaim: {claimName: vaultstore-restores}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector: {app: vaultstore-api}
+  ports: [{port: 8080, targetPort: 8080}]
